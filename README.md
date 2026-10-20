@@ -10,6 +10,24 @@
         <img src="https://doi.org/10.5281/zenodo.17458129" /></a>
 </p>
 
+## Frozen BGC embeddings
+
+For candidate-independent BGC similarity features without additional training,
+use `python -m experiment.extract_features` from the repository root. It supports
+direct ESM pooling and frozen MAC/MAP BGC encoders, followed by masked mean and
+L2 normalization. Inputs can be existing ESM caches or GenBank files; exports
+include vectors, aligned BGC IDs, preprocessing provenance and exclusions.
+
+```bash
+python -m experiment.extract_features \
+  --esm-cache data/BGC_4.0/Esm2_rep_mibig.pth \
+  --route esm \
+  --output outputs/features_esm
+```
+
+See [the frozen feature extraction guide](docs/frozen-features.md) for MAC/MAP
+checkpoint selection, fresh GBK encoding, long-protein handling and validation.
+
 ## Setup
 
 ### Configuration requirement
