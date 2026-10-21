@@ -28,6 +28,25 @@ python -m experiment.extract_features \
 See [the frozen feature extraction guide](docs/frozen-features.md) for MAC/MAP
 checkpoint selection, fresh GBK encoding, long-protein handling and validation.
 
+### UMAP visualization
+
+Plot an existing feature export without rerunning the encoder. Colors show the
+author's full class combinations (for example, NRPS+PKS); a second plot shows
+token count on the same coordinates. Labels never enter UMAP fitting.
+
+```bash
+python -m pip install -e '.[visualization]'
+python -m visualization.umap_features \
+  --features-dir outputs/features_esm \
+  --labels data/BGC_4.0/MAC_metadata.pkl \
+  --output outputs/umap_esm
+```
+
+The optional extra adds `umap-learn` (including its Numba/PyNNDescent dependencies);
+NumPy, pandas and Matplotlib are already listed in the original environment.
+See [the UMAP guide](docs/umap-features.md) for MAC/MAP commands, adjustable
+parameters, ID validation, missing labels, output files and interpretation limits.
+
 ## Setup
 
 ### Configuration requirement
