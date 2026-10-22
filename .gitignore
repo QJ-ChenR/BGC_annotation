@@ -33,6 +33,9 @@ deprecated/
 *.err
 *.out
 
+# BGC_transformer
+**/BGC_transformer
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
