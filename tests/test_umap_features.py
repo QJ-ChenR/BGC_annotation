@@ -65,7 +65,7 @@ class UMAPFeaturesTests(unittest.TestCase):
         self.assertEqual(metadata["route"], "esm")
 
     def test_output_dimension_is_read_from_matrix(self):
-        for dimension in (5, 256, 1024, 1280):
+        for dimension in (5, 256, 768, 1024, 1280):
             with self.subTest(dimension=dimension):
                 array = np.ones((4, dimension), dtype=np.float32)
                 actual, _, _ = umap_features.load_features(
@@ -228,6 +228,44 @@ class UMAPFeaturesTests(unittest.TestCase):
         self.assertEqual(metadata["feature_dimension"], 3)
         self.assertEqual(metadata["umap_parameters"]["metric"], "cosine")
         self.assertEqual(metadata["umap_parameters"]["n_neighbors"], 2)
+        legacy_label = "Token count (input domains / whole-protein fallbacks)"
+        self.assertEqual(metadata["token_count_unit"], "domain_protein_tokens")
+        self.assertEqual(metadata["plot_parameters"]["token_count_label"], legacy_label)
+        self.assertEqual(plots.call_args.kwargs["token_count_label"], legacy_label)
+
+    def test_dna_export_uses_bpe_units_without_changing_reducer_inputs(self):
+        from matplotlib.figure import Figure
+
+        vectors = np.ones((4, 768), dtype=np.float32)
+        features = self.features(vectors, metadata={
+            "route": "dna", "extractor": {"route": "dna"},
+            "token_count_unit": "dna_bpe_tokens",
+        })
+        args = self.args(features=features)
+        coords = np.array([[0, 0], [1, 3], [2, 1], [4, 5]], dtype=np.float32)
+        colorbar_labels = []
+
+        def capture_label(figure, path, *args, **kwargs):
+            if Path(path).stem == "umap_token_count":
+                colorbar_labels.append(figure.axes[-1].get_ylabel())
+
+        with patch.object(umap_features, "fit_umap", return_value=coords) as fit, \
+                patch.object(Figure, "savefig", new=capture_label):
+            metadata = umap_features.run(args)
+        np.testing.assert_array_equal(fit.call_args.args[0], vectors)
+        self.assertEqual(len(fit.call_args.args), 1)
+        self.assertEqual(set(fit.call_args.kwargs),
+                         {"metric", "n_neighbors", "min_dist", "random_state"})
+        expected_label = "DNA BPE token count (excluding special tokens)"
+        self.assertEqual(colorbar_labels, [expected_label, expected_label])
+        self.assertEqual(metadata["feature_dimension"], 768)
+        self.assertEqual(metadata["token_count_unit"], "dna_bpe_tokens")
+        self.assertEqual(metadata["feature_source"]["route"], "dna")
+        self.assertEqual(metadata["plot_parameters"]["token_count_label"], expected_label)
+        self.assertFalse(metadata["labels_used_for_fit"])
+        self.assertFalse(metadata["token_count_used_for_fit"])
+        on_disk = json.loads((args.output / "umap_metadata.json").read_text())
+        self.assertEqual(on_disk, metadata)
 
     def test_invalid_reducer_coordinates_are_not_plotted_or_exported(self):
         features = self.features()

@@ -20,12 +20,17 @@ ALIASES = {name.lower(): name for name in CLASS_NAMES}
 ALIASES.update({"ribosomal": "RiPP", "ripps": "RiPP"})
 OUTPUT_FILES = ("umap_classes.png", "umap_classes.pdf", "umap_token_count.png",
                 "umap_token_count.pdf", "umap_coordinates.tsv", "umap_metadata.json")
+DEFAULT_TOKEN_COUNT_UNIT = "domain_protein_tokens"
+TOKEN_COUNT_LABELS = {
+    DEFAULT_TOKEN_COUNT_UNIT: "Token count (input domains / whole-protein fallbacks)",
+    "dna_bpe_tokens": "DNA BPE token count (excluding special tokens)",
+}
 
 
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--features-dir", type=Path, required=True,
-                        help="Export from experiment.extract_features (any encoder route).")
+                        help="A bgc_vectors_v1 export from a protein or DNA encoder.")
     parser.add_argument("--labels", type=Path, default=Path("data/BGC_4.0/MAC_metadata.pkl"),
                         help="Author-provided, trusted pandas pickle with BGC_number/biosyn_class.")
     parser.add_argument("--output", type=Path, required=True)
@@ -151,7 +156,8 @@ def _category_colors(categories):
     return colors
 
 
-def plot_outputs(table, colors, output, point_size, alpha, dpi):
+def plot_outputs(table, colors, output, point_size, alpha, dpi,
+                 token_count_label=TOKEN_COUNT_LABELS[DEFAULT_TOKEN_COUNT_UNIT]):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -177,7 +183,7 @@ def plot_outputs(table, colors, output, point_size, alpha, dpi):
                 points = ax.scatter(coords[:, 0], coords[:, 1], c=table["token_count"],
                                     cmap="viridis", s=point_size, alpha=alpha, linewidths=0)
                 bar = fig.colorbar(points, cax=fig.add_axes((0.62, 0.2, 0.025, 0.6)))
-                bar.set_label("Token count (input domains / whole-protein fallbacks)")
+                bar.set_label(token_count_label)
                 title = "BGC token count"
             ax.set(xlim=(lower[0] - margin[0], upper[0] + margin[0]),
                    ylim=(lower[1] - margin[1], upper[1] + margin[1]),
@@ -206,6 +212,8 @@ def _versions():
 
 def run(args):
     vectors, rows, source = load_features(args.features_dir)
+    token_count_unit = source.get("token_count_unit", DEFAULT_TOKEN_COUNT_UNIT)
+    token_count_label = TOKEN_COUNT_LABELS.get(token_count_unit, f"Token count ({token_count_unit})")
     if len(vectors) < 4 or not 2 <= args.n_neighbors < len(vectors):
         raise ValueError("UMAP requires at least 4 BGCs and 2 <= n-neighbors < BGC count.")
     if not 0 <= args.min_dist <= 1:
@@ -242,16 +250,19 @@ def run(args):
         "umap_parameters": {**parameters, "n_components": 2, "n_jobs": 1, "spread": 1.0,
                             "init": "spectral"},
         "labels_used_for_fit": False, "token_count_used_for_fit": False,
+        "token_count_unit": token_count_unit,
         "unknown_count": len(unknown_ids), "unknown_ids": unknown_ids,
         "missing_label_ids": [bgc_id for bgc_id in rows["bgc_id"] if bgc_id not in labels],
         "unused_label_count": len(set(labels) - set(rows["bgc_id"])),
         "category_counts": {label: int((table["labels"] == label).sum()) for label in colors},
         "category_colors": colors, "multi_label_count": int((table["label_count"] > 1).sum()),
-        "plot_parameters": {"point_size": args.point_size, "alpha": args.alpha, "dpi": args.dpi},
+        "plot_parameters": {"point_size": args.point_size, "alpha": args.alpha, "dpi": args.dpi,
+                            "token_count_label": token_count_label},
         "versions": _versions(), "output_files": list(OUTPUT_FILES),
     }
     args.output.mkdir(parents=True, exist_ok=True)
-    plot_outputs(table, colors, args.output, args.point_size, args.alpha, args.dpi)
+    plot_outputs(table, colors, args.output, args.point_size, args.alpha, args.dpi,
+                 token_count_label=token_count_label)
     table.to_csv(args.output / "umap_coordinates.tsv", sep="\t", index=False, float_format="%.9g")
     with (args.output / "umap_metadata.json").open("w", encoding="utf-8") as handle:
         json.dump(metadata, handle, indent=2, ensure_ascii=False, allow_nan=False)

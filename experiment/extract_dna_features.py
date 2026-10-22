@@ -1,0 +1,189 @@
+"""Export one frozen ModernBERT DNA vector per BGC for the existing UMAP CLI."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import importlib.metadata
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+from data_preparation.dna_inputs import DNA_INPUT_VERSION, discover_gbk, read_dna
+from data_preparation.feature_cache import file_sha256
+
+
+OUTPUT_FILES = ("embeddings.npy", "bgc_ids.tsv", "metadata.json", "failures.tsv")
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--gbk", type=Path, required=True, help="One single-record GenBank file or directory.")
+    parser.add_argument("--checkpoint", type=Path, required=True, help="Local trained HF MLM checkpoint directory.")
+    parser.add_argument("--tokenizer", type=Path, help="Tokenizer directory if separate from the checkpoint.")
+    parser.add_argument("--config", type=Path, help="Config file/directory if separate from the checkpoint.")
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--dtype", choices=("float32", "bfloat16", "float16"), default="float32")
+    parser.add_argument("--attention-backend", choices=("sdpa", "eager", "flash_attention_2"), default="sdpa")
+    parser.add_argument("--max-tokens", type=int, help="Total tokens per window, including CLS/SEP; defaults to config limit.")
+    parser.add_argument("--window-batch-size", type=int, default=1)
+    parser.add_argument("--ids-from", type=Path, help="Optional existing bgc_ids.tsv to select the same BGC cohort.")
+    parser.add_argument("--exclude-id", action="append", default=[], help="Explicit BGC exclusion, repeatable and recorded.")
+    parser.add_argument("--skip-invalid", action="store_true", help="Record invalid inputs and export the remaining BGCs.")
+    return parser
+
+
+def _write_json(path, value):
+    path.write_text(json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False) + "\n", encoding="utf-8")
+
+
+def _write_failures(path, failures):
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=("bgc_id", "source", "stage", "error"), delimiter="\t")
+        writer.writeheader()
+        writer.writerows(failures)
+
+
+def _select_paths(args):
+    paths = discover_gbk(args.gbk)
+    if args.ids_from is not None:
+        with args.ids_from.open(encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle, delimiter="\t")
+            if not reader.fieldnames or "bgc_id" not in reader.fieldnames:
+                raise ValueError("--ids-from must contain a bgc_id column.")
+            ids = [row["bgc_id"] for row in reader]
+        if not ids or any(not key or key.strip() != key for key in ids) or len(ids) != len(set(ids)):
+            raise ValueError("--ids-from must contain nonempty, unique BGC IDs without surrounding whitespace.")
+        missing = set(ids) - {path.stem for path in paths}
+        if missing:
+            raise ValueError(f"Missing GenBank files for requested IDs: {sorted(missing)[:10]}")
+        selected = set(ids)
+        paths = [path for path in paths if path.stem in selected]
+    exclusions = set(args.exclude_id)
+    unknown = exclusions - {path.stem for path in paths}
+    if unknown:
+        raise ValueError(f"Excluded IDs are absent from the selected cohort: {sorted(unknown)}")
+    return paths
+
+
+def _versions():
+    result = {"python": sys.version.split()[0]}
+    for package in ("numpy", "torch", "transformers", "tokenizers", "biopython", "safetensors"):
+        try:
+            result[package] = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            pass
+    return result
+
+
+def run(args):
+    if args.window_batch_size <= 0 or (args.max_tokens is not None and args.max_tokens <= 2):
+        raise ValueError("window-batch-size must be positive and max-tokens must exceed 2.")
+    paths = _select_paths(args)
+    if len(set(args.exclude_id)) == len(paths):
+        raise ValueError("All selected BGCs were explicitly excluded.")
+    args.output.mkdir(parents=True, exist_ok=True)
+    if any((args.output / name).exists() for name in OUTPUT_FILES):
+        raise ValueError("Output artifacts already exist; choose a new --output directory.")
+    failures, ids, vectors, records = [], [], [], {}
+    try:
+        from data_preparation.frozen_dna import FrozenDNA
+
+        encoder = FrozenDNA.from_checkpoint(
+            args.checkpoint, tokenizer_path=args.tokenizer, config_path=args.config,
+            device=args.device, dtype=args.dtype, attention_backend=args.attention_backend,
+            max_tokens=args.max_tokens, batch_size=args.window_batch_size,
+        )
+        for index, path in enumerate(paths):
+            if path.stem in args.exclude_id:
+                failures.append({"bgc_id": path.stem, "source": str(path), "stage": "user_exclusion",
+                                 "error": "Explicitly excluded with --exclude-id"})
+                continue
+            stage = "gbk_to_dna"
+            try:
+                sequence, record = read_dna(path)
+                stage = "dna_encoding"
+                vector, encoding = encoder.encode(sequence)
+                array = vector.detach().cpu().numpy().astype(np.float32, copy=False)
+                if array.ndim != 1 or not len(array) or not np.isfinite(array).all() or not np.any(array):
+                    raise ValueError("DNA encoder produced an invalid vector.")
+                if vectors and array.shape != vectors[0].shape:
+                    raise ValueError("DNA encoder output dimension changed between BGCs.")
+                if not np.isclose(np.linalg.norm(array), 1, atol=1e-5):
+                    raise ValueError("DNA vector is not L2 normalized.")
+                if not isinstance(encoding.get("token_count"), int) or encoding["token_count"] <= 0:
+                    raise ValueError("DNA encoder must report a positive content token_count.")
+                ids.append(path.stem)
+                vectors.append(array)
+                records[path.stem] = {**record, **encoding}
+            except (ValueError, RuntimeError, OSError, TypeError, KeyError) as exc:
+                failures.append({"bgc_id": path.stem, "source": str(path), "stage": stage,
+                                 "error": f"{type(exc).__name__}: {exc}"})
+                if not args.skip_invalid:
+                    raise ValueError(f"Input failed for {path.stem}; see failures.tsv.") from exc
+            if index == 0 or (index + 1) % 25 == 0 or index + 1 == len(paths):
+                print(f"DNA encoding: {index + 1}/{len(paths)} inputs, {len(ids)} vectors", file=sys.stderr, flush=True)
+        if not vectors:
+            raise ValueError("No valid BGC vectors remain.")
+        array = np.stack(vectors)
+        root = Path(__file__).resolve().parents[1]
+        metadata = {
+            "format": "bgc_vectors_v1",
+            "status": "complete_with_exclusions" if failures else "complete",
+            "route": "dna", "count": len(ids), "dimension": int(array.shape[1]), "dtype": "float32",
+            "pooling": "content_token_mean_across_nonoverlapping_windows", "normalization": "l2",
+            "token_count_unit": "dna_bpe_tokens",
+            "similarity": "cosine equals dot product of exported vectors",
+            "device": args.device, "inference_dtype": args.dtype, "window_batch_size": args.window_batch_size,
+            "extractor": encoder.metadata,
+            "input": {
+                "format": DNA_INPUT_VERSION, "path": str(args.gbk.resolve()), "input_count": len(paths),
+                "sequence_scope": "entire single GenBank record; includes coding and noncoding sequence",
+                "preprocessing": "uppercase; retain ambiguous IUPAC bases; retain original orientation",
+                "reverse_complement_averaging": False,
+                "training_preprocessing_verified": False,
+                "cohort": None if args.ids_from is None else {
+                    "path": str(args.ids_from.resolve()), "sha256": file_sha256(args.ids_from)},
+                "explicit_exclusions": sorted(set(args.exclude_id)),
+            },
+            "records": records, "excluded_count": len(failures),
+            "invalid_count": sum(item["stage"] != "user_exclusion" for item in failures),
+            "versions": _versions(),
+            "source_sha256": {name: file_sha256(root / name) for name in (
+                "experiment/extract_dna_features.py", "data_preparation/dna_inputs.py",
+                "data_preparation/frozen_dna.py")},
+        }
+        np.save(args.output / "embeddings.npy", array, allow_pickle=False)
+        with (args.output / "bgc_ids.tsv").open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle, delimiter="\t")
+            writer.writerow(("row", "bgc_id", "token_count"))
+            writer.writerows((row, key, records[key]["token_count"]) for row, key in enumerate(ids))
+        _write_failures(args.output / "failures.tsv", failures)
+        _write_json(args.output / "metadata.json", metadata)
+        return metadata
+    except Exception as exc:
+        _write_failures(args.output / "failures.tsv", failures)
+        _write_json(args.output / "metadata.json", {
+            "format": "bgc_vectors_v1", "status": "failed", "route": "dna",
+            "error": f"{type(exc).__name__}: {exc}", "excluded_count": len(failures),
+        })
+        raise
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        metadata = run(args)
+    except (ValueError, RuntimeError, OSError, TypeError, KeyError, ImportError) as exc:
+        parser.exit(1, f"DNA feature extraction failed: {exc}\n")
+    print(f"Saved {metadata['count']} DNA vectors ({metadata['dimension']} dimensions) to {args.output}")
+    if metadata["excluded_count"]:
+        print(f"Excluded {metadata['excluded_count']} inputs; see failures.tsv.")
+
+
+if __name__ == "__main__":
+    main()

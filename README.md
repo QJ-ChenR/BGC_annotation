@@ -28,6 +28,25 @@ python -m experiment.extract_features \
 See [the frozen feature extraction guide](docs/frozen-features.md) for MAC/MAP
 checkpoint selection, fresh GBK encoding, long-protein handling and validation.
 
+### Independent frozen DNA features
+
+Use a local, trained `ModernBertForMaskedLM` checkpoint to encode complete BGC
+DNA from GenBank. The DNA branch covers the entire BPE sequence using disjoint
+windows, averages content hidden states across windows, and L2-normalizes one
+vector per BGC. It exports the same vector/ID/metadata format as the protein routes.
+
+```bash
+python -m pip install -e '.[dna,visualization]'
+python -m experiment.extract_dna_features \
+  --gbk /path/to/mibig_gbk_4.0 \
+  --checkpoint /path/to/trained/checkpoint \
+  --device cuda:0 --output outputs/features_dna
+```
+
+See [the DNA architecture audit and server guide](docs/dna-features.md) for the
+768-dimensional model, tokenizer/config discrepancies, complete-coverage windowing,
+matching the protein cohort, and running the existing UMAP command on DNA exports.
+
 ### UMAP visualization
 
 Plot an existing feature export without rerunning the encoder. Colors show the
