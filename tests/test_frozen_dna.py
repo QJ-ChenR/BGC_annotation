@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from data_preparation.frozen_dna import FrozenDNA, _weight_files
+from data_preparation.frozen_dna import DNASequenceTooLongError, FrozenDNA, _weight_files
 
 
 def fake_config(**updates):
@@ -116,6 +116,49 @@ class FrozenDNATests(unittest.TestCase):
         self.assertEqual(ids.tolist(), [[1, 5, 6, 7, 2], [1, 8, 5, 6, 2], [1, 7, 2, 3, 3]])
         self.assertEqual(mask[-1].tolist(), [1, 1, 1, 0, 0])
 
+    def test_full_sequence_ignores_config_length_without_changing_it(self):
+        encoder = self.encoder(sequence_mode="full")
+        before = {name: value.detach().clone() for name, value in self.model.named_parameters()}
+        vector, metadata = encoder.encode("ACGTACGTACG")
+        torch.testing.assert_close(vector, self.expected([5, 6, 7, 8, 5, 6, 7, 8, 5, 6, 7]))
+        self.assertEqual(len(self.model.seen), 1)
+        self.assertEqual(self.model.seen[0][0].tolist(), [[1, 5, 6, 7, 8, 5, 6, 7, 8, 5, 6, 7, 2]])
+        self.assertEqual(metadata["window_count"], 1)
+        self.assertEqual(metadata["forward_pass_count"], 1)
+        self.assertEqual(metadata["forward_input_shapes"], [[1, 13]])
+        self.assertEqual(metadata["total_input_tokens"], 13)
+        self.assertEqual(metadata["max_forward_tokens"], 13)
+        self.assertTrue(metadata["exceeds_config_max_position_embeddings"])
+        self.assertEqual(metadata["windows"], [{
+            "token_start": 0, "token_end": 11, "base_start": 0, "base_end": 11,
+        }])
+        self.assertEqual(self.model.config.max_position_embeddings, 8)
+        self.assertIsNone(encoder.metadata["max_tokens"])
+        self.assertEqual(encoder.metadata["context_scope"], "entire_bgc")
+        self.assertFalse(encoder.metadata["config_length_enforced"])
+        self.assertFalse(encoder.metadata["automatic_window_fallback"])
+        for name, parameter in self.model.named_parameters():
+            torch.testing.assert_close(parameter, before[name], atol=0, rtol=0)
+            self.assertFalse(parameter.requires_grad)
+            self.assertIsNone(parameter.grad)
+
+    def test_full_explicit_limit_counts_specials_and_fails_before_forward(self):
+        encoder = self.encoder(sequence_mode="full", max_tokens=10)
+        encoder.encode("ACGTACGT")
+        self.assertEqual(len(self.model.seen), 1)
+        with self.assertRaises(DNASequenceTooLongError) as context:
+            encoder.encode("ACGTACGTA")
+        self.assertEqual(context.exception.input_tokens, 11)
+        self.assertEqual(context.exception.limit, 10)
+        self.assertEqual(len(self.model.seen), 1)
+
+    def test_full_oom_propagates_without_chunk_fallback(self):
+        encoder = self.encoder(sequence_mode="full")
+        with patch.object(self.model, "forward", side_effect=torch.cuda.OutOfMemoryError("test OOM")) as forward:
+            with self.assertRaises(torch.cuda.OutOfMemoryError):
+                encoder.encode("ACGTACGTACG")
+        self.assertEqual(forward.call_count, 1)
+
     def test_bpe_pooling_weights_tokens_not_nucleotides(self):
         encoder = self.encoder(max_tokens=3)
         vector, metadata = encoder.encode("AAC")
@@ -167,6 +210,9 @@ class FrozenDNATests(unittest.TestCase):
         for kwargs in (
             {"pooling": "cls"}, {"max_tokens": 2}, {"max_tokens": 9},
             {"batch_size": 0}, {"dtype": "auto"}, {"attention_backend": "invalid"},
+            {"sequence_mode": "auto"}, {"sequence_mode": "full", "batch_size": 2},
+            {"sequence_mode": "full", "max_tokens": True},
+            {"attention_backend": "flash_attention_2", "dtype": "float32"},
         ):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 self.encoder(**kwargs)

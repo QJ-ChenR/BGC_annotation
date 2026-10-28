@@ -31,20 +31,40 @@ checkpoint selection, fresh GBK encoding, long-protein handling and validation.
 ### Independent frozen DNA features
 
 Use a local, trained `ModernBertForMaskedLM` checkpoint to encode complete BGC
-DNA from GenBank. The DNA branch covers the entire BPE sequence using disjoint
-windows, averages content hidden states across windows, and L2-normalizes one
-vector per BGC. It exports the same vector/ID/metadata format as the protein routes.
+DNA from GenBank. `--sequence-mode full` sends the complete BPE sequence through
+one frozen backbone forward, averages content hidden states, and L2-normalizes
+one vector per BGC. The existing `windowed` mode remains the default for backward
+compatibility and provides a full-coverage comparison. No weights or RoPE settings
+are changed, and full mode never silently truncates or falls back to windows.
+Both modes export the same vector/ID/metadata format as the protein routes.
 
 ```bash
 python -m pip install -e '.[dna,visualization]'
+python -m experiment.validate_dna_encoding \
+  --gbk /path/to/mibig_gbk_4.0 \
+  --checkpoint /path/to/trained/checkpoint \
+  --device cuda:0 --dtype bfloat16 --attention-backend flash_attention_2 \
+  --sample-count 5 --exclude-id BGC0002977 \
+  --output outputs/validation_dna_full
+
 python -m experiment.extract_dna_features \
   --gbk /path/to/mibig_gbk_4.0 \
   --checkpoint /path/to/trained/checkpoint \
-  --device cuda:0 --output outputs/features_dna
+  --sequence-mode full \
+  --device cuda:0 --dtype bfloat16 --attention-backend flash_attention_2 \
+  --exclude-id BGC0002977 --output outputs/features_dna_full
 ```
 
+These GPU commands require a compatible Flash Attention 2 installation. The
+validation script samples by BPE length, verifies the actual full input, frozen
+parameters and pooling, compares against windows at the same precision/backend,
+and records timing, peak GPU memory and failures. A 48 GB GPU does not guarantee
+that every length will fit; failed records are never reported as successful
+full-length encodings. The explicit exclusion is the known chromosome-scale
+MIBiG record; omit it when intentionally studying that record.
+
 See [the DNA architecture audit and server guide](docs/dna-features.md) for the
-768-dimensional model, tokenizer/config discrepancies, complete-coverage windowing,
+768-dimensional model, full-length versus windowed semantics, validation outputs,
 matching the protein cohort, and running the existing UMAP command on DNA exports.
 
 ### UMAP visualization

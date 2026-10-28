@@ -28,11 +28,20 @@ def build_parser():
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--dtype", choices=("float32", "bfloat16", "float16"), default="float32")
     parser.add_argument("--attention-backend", choices=("sdpa", "eager", "flash_attention_2"), default="sdpa")
-    parser.add_argument("--max-tokens", type=int, help="Total tokens per window, including CLS/SEP; defaults to config limit.")
-    parser.add_argument("--window-batch-size", type=int, default=1)
+    parser.add_argument(
+        "--sequence-mode", choices=("windowed", "full"), default="windowed",
+        help="windowed preserves the original baseline; full encodes the entire BGC in one forward, without truncation.",
+    )
+    parser.add_argument(
+        "--max-tokens", type=int,
+        help="Including CLS/SEP: windowed mode uses this window size (default: config limit); "
+             "full mode uses it only as an optional hard input limit (default: unlimited). "
+             "Exceeding a full-mode limit fails; it never truncates or switches to windows.",
+    )
+    parser.add_argument("--window-batch-size", type=int, default=1, help="Windows per forward; full mode requires 1.")
     parser.add_argument("--ids-from", type=Path, help="Optional existing bgc_ids.tsv to select the same BGC cohort.")
     parser.add_argument("--exclude-id", action="append", default=[], help="Explicit BGC exclusion, repeatable and recorded.")
-    parser.add_argument("--skip-invalid", action="store_true", help="Record invalid inputs and export the remaining BGCs.")
+    parser.add_argument("--skip-invalid", action="store_true", help="Record invalid inputs and export the remaining BGCs; memory errors and full-input limits remain fatal.")
     return parser
 
 
@@ -79,9 +88,20 @@ def _versions():
     return result
 
 
+def _is_out_of_memory(exc):
+    """OOM is an execution failure, never grounds for silently reducing a cohort."""
+    import torch
+
+    return isinstance(exc, (MemoryError, torch.OutOfMemoryError)) or (
+        isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
+    )
+
+
 def run(args):
     if args.window_batch_size <= 0 or (args.max_tokens is not None and args.max_tokens <= 2):
         raise ValueError("window-batch-size must be positive and max-tokens must exceed 2.")
+    if args.sequence_mode == "full" and args.window_batch_size != 1:
+        raise ValueError("Full sequence mode requires --window-batch-size 1.")
     paths = _select_paths(args)
     if len(set(args.exclude_id)) == len(paths):
         raise ValueError("All selected BGCs were explicitly excluded.")
@@ -89,13 +109,16 @@ def run(args):
     if any((args.output / name).exists() for name in OUTPUT_FILES):
         raise ValueError("Output artifacts already exist; choose a new --output directory.")
     failures, ids, vectors, records = [], [], [], {}
+    attempted_ids = []
+    encoder = None
     try:
-        from data_preparation.frozen_dna import FrozenDNA
+        from data_preparation.frozen_dna import DNASequenceTooLongError, FrozenDNA
 
         encoder = FrozenDNA.from_checkpoint(
             args.checkpoint, tokenizer_path=args.tokenizer, config_path=args.config,
             device=args.device, dtype=args.dtype, attention_backend=args.attention_backend,
             max_tokens=args.max_tokens, batch_size=args.window_batch_size,
+            sequence_mode=args.sequence_mode,
         )
         for index, path in enumerate(paths):
             if path.stem in args.exclude_id:
@@ -103,6 +126,7 @@ def run(args):
                                  "error": "Explicitly excluded with --exclude-id"})
                 continue
             stage = "gbk_to_dna"
+            attempted_ids.append(path.stem)
             try:
                 sequence, record = read_dna(path)
                 stage = "dna_encoding"
@@ -116,12 +140,26 @@ def run(args):
                     raise ValueError("DNA vector is not L2 normalized.")
                 if not isinstance(encoding.get("token_count"), int) or encoding["token_count"] <= 0:
                     raise ValueError("DNA encoder must report a positive content token_count.")
+                if args.sequence_mode == "full" and (
+                    encoding.get("window_count") != 1 or encoding.get("forward_pass_count") != 1
+                ):
+                    raise ValueError("Full sequence mode must encode exactly one complete window in one forward.")
                 ids.append(path.stem)
                 vectors.append(array)
                 records[path.stem] = {**record, **encoding}
-            except (ValueError, RuntimeError, OSError, TypeError, KeyError) as exc:
+            except (ValueError, RuntimeError, OSError, TypeError, KeyError, MemoryError) as exc:
+                out_of_memory = _is_out_of_memory(exc)
                 failures.append({"bgc_id": path.stem, "source": str(path), "stage": stage,
                                  "error": f"{type(exc).__name__}: {exc}"})
+                if out_of_memory:
+                    failures[-1]["stage"] = "resource_oom"
+                    raise RuntimeError(
+                        f"Out of memory while encoding {path.stem}; --skip-invalid does not skip resource failures. "
+                        "No windowed fallback was attempted; see failures.tsv and metadata.json."
+                    ) from exc
+                if isinstance(exc, DNASequenceTooLongError):
+                    failures[-1]["stage"] = "resource_token_limit"
+                    raise
                 if not args.skip_invalid:
                     raise ValueError(f"Input failed for {path.stem}; see failures.tsv.") from exc
             if index == 0 or (index + 1) % 25 == 0 or index + 1 == len(paths):
@@ -134,7 +172,12 @@ def run(args):
             "format": "bgc_vectors_v1",
             "status": "complete_with_exclusions" if failures else "complete",
             "route": "dna", "count": len(ids), "dimension": int(array.shape[1]), "dtype": "float32",
-            "pooling": "content_token_mean_across_nonoverlapping_windows", "normalization": "l2",
+            "sequence_mode": args.sequence_mode,
+            "pooling": (
+                "content_token_mean_single_full_sequence" if args.sequence_mode == "full"
+                else "content_token_mean_across_nonoverlapping_windows"
+            ),
+            "normalization": "l2",
             "token_count_unit": "dna_bpe_tokens",
             "similarity": "cosine equals dot product of exported vectors",
             "device": args.device, "inference_dtype": args.dtype, "window_batch_size": args.window_batch_size,
@@ -169,6 +212,22 @@ def run(args):
         _write_json(args.output / "metadata.json", {
             "format": "bgc_vectors_v1", "status": "failed", "route": "dna",
             "error": f"{type(exc).__name__}: {exc}", "excluded_count": len(failures),
+            "sequence_mode": args.sequence_mode,
+            "device": args.device, "inference_dtype": args.dtype,
+            "attention_backend": args.attention_backend,
+            "requested_max_tokens": args.max_tokens,
+            "extractor": None if encoder is None else encoder.metadata,
+            "input_count": len(paths),
+            "selected_ids": [path.stem for path in paths],
+            "explicit_exclusions": sorted(set(args.exclude_id)),
+            "attempted_ids": attempted_ids,
+            "completed_count": len(ids), "completed_ids": ids,
+            "completed_records": records,
+            "export_complete": False,
+            "unprocessed_ids": [
+                path.stem for path in paths
+                if path.stem not in attempted_ids and path.stem not in args.exclude_id
+            ],
         })
         raise
 
@@ -178,7 +237,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         metadata = run(args)
-    except (ValueError, RuntimeError, OSError, TypeError, KeyError, ImportError) as exc:
+    except (ValueError, RuntimeError, OSError, TypeError, KeyError, ImportError, MemoryError) as exc:
         parser.exit(1, f"DNA feature extraction failed: {exc}\n")
     print(f"Saved {metadata['count']} DNA vectors ({metadata['dimension']} dimensions) to {args.output}")
     if metadata["excluded_count"]:

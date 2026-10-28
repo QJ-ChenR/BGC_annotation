@@ -1,7 +1,8 @@
-"""Local, frozen ModernBERT DNA representations with complete token coverage.
+"""Local frozen ModernBERT DNA features with full or windowed context.
 
-Windowing is an inference policy, not evidence that the checkpoint was trained
-with that policy. Tokens in separate windows cannot attend to each other.
+Full mode uses one backbone forward per BGC, without imposing the saved
+max_position_embeddings as an input-length cap. Windowed mode retains the
+original conservative baseline. Neither mode changes weights or RoPE settings.
 """
 
 from hashlib import sha256
@@ -10,6 +11,19 @@ from pathlib import Path
 import warnings
 
 import torch
+
+
+class DNASequenceTooLongError(ValueError):
+    """An explicit full-sequence resource limit was exceeded; never truncate."""
+
+    def __init__(self, input_tokens, limit):
+        self.input_tokens = input_tokens
+        self.limit = limit
+        super().__init__(
+            f"Full DNA input requires {input_tokens} tokens including CLS/SEP, "
+            f"exceeding the explicit max_tokens={limit}. No truncation or "
+            "windowed fallback was performed."
+        )
 
 
 def _sha256(path):
@@ -66,9 +80,10 @@ class FrozenDNA:
     """Return one unit-normalized CPU float32 vector per entire DNA sequence.
 
     The BPE tokenizer processes the full sequence without truncation. Its content
-    tokens are divided into disjoint windows, with CLS/SEP added separately to
-    each window. The final backbone hidden states are averaged over *content
-    tokens*, including UNK, and L2-normalized once after combining all windows.
+    tokens are either passed together in one forward (``sequence_mode='full'``)
+    or divided into disjoint windows (the backwards-compatible default).
+    CLS/SEP are added per forward sequence. Final backbone hidden states are
+    averaged over *content tokens*, including UNK, then L2-normalized once.
     Neither special tokens nor padding participate in the average. BPE tokens
     have variable nucleotide lengths; this is intentionally token-weighted.
     """
@@ -76,26 +91,35 @@ class FrozenDNA:
     def __init__(
         self, model, tokenizer, *, device="cpu", dtype="float32",
         attention_backend="sdpa", max_tokens=None, batch_size=1,
-        pooling="token_mean", provenance=None,
+        pooling="token_mean", provenance=None, sequence_mode="windowed",
     ):
         if pooling != "token_mean":
             raise ValueError("DNA pooling must be 'token_mean'")
         if attention_backend not in ("sdpa", "eager", "flash_attention_2"):
             raise ValueError("Unsupported attention backend")
+        if sequence_mode not in ("windowed", "full"):
+            raise ValueError("sequence_mode must be 'windowed' or 'full'")
         if not isinstance(batch_size, int) or isinstance(batch_size, bool) or batch_size < 1:
             raise ValueError("batch_size must be a positive integer")
+        if sequence_mode == "full" and batch_size != 1:
+            raise ValueError("Full sequence mode requires batch_size=1 (one BGC per forward)")
+        if attention_backend == "flash_attention_2" and _dtype(dtype) == torch.float32:
+            raise ValueError("flash_attention_2 requires float16 or bfloat16; use sdpa for float32")
         config = model.config
         if getattr(config, "model_type", None) != "modernbert":
             raise ValueError("Expected a ModernBERT backbone")
         configured_limit = int(config.max_position_embeddings)
-        max_tokens = configured_limit if max_tokens is None else max_tokens
-        if (
-            not isinstance(max_tokens, int) or isinstance(max_tokens, bool)
-            or not 3 <= max_tokens <= configured_limit
+        if sequence_mode == "windowed" and max_tokens is None:
+            max_tokens = configured_limit
+        if max_tokens is not None and (
+            not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens < 3
         ):
+            raise ValueError("max_tokens must be an integer greater than 2, including CLS/SEP")
+        if sequence_mode == "windowed" and max_tokens > configured_limit:
             raise ValueError(
-                "max_tokens must include CLS/SEP and be between 3 and "
-                f"config.max_position_embeddings ({configured_limit})"
+                "Windowed max_tokens must not exceed "
+                f"config.max_position_embeddings ({configured_limit}); "
+                "use sequence_mode='full' for a full BGC forward"
             )
         if not getattr(tokenizer, "is_fast", False):
             raise ValueError("A fast tokenizer with nucleotide offsets is required")
@@ -135,8 +159,9 @@ class FrozenDNA:
         self.tokenizer = tokenizer
         self.special_ids = token_ids
         self.embedding_dim = int(config.hidden_size)
+        self.sequence_mode = sequence_mode
         self.max_tokens = max_tokens
-        self.max_content_tokens = max_tokens - 2
+        self.max_content_tokens = None if max_tokens is None else max_tokens - 2
         self.batch_size = batch_size
         self.attention_backend = attention_backend
         self.pooling = pooling
@@ -147,7 +172,7 @@ class FrozenDNA:
     def from_checkpoint(
         cls, path, *, tokenizer_path=None, config_path=None, device="cpu",
         dtype="float32", attention_backend="sdpa", max_tokens=None,
-        batch_size=1, pooling="token_mean",
+        batch_size=1, pooling="token_mean", sequence_mode="windowed",
     ):
         """Load an entire trained MLM checkpoint strictly and retain its backbone.
 
@@ -157,6 +182,9 @@ class FrozenDNA:
         path = Path(path).resolve()
         if not path.is_dir():
             raise FileNotFoundError(f"Local checkpoint directory not found: {path}")
+        # Reject unsupported FA2 precision before allocating checkpoint tensors.
+        if attention_backend == "flash_attention_2" and _dtype(dtype) == torch.float32:
+            raise ValueError("flash_attention_2 requires float16 or bfloat16; use sdpa for float32")
         files = _weight_files(path)
         tokenizer_path = Path(tokenizer_path or path).resolve()
         config_path = Path(config_path or path).resolve()
@@ -219,6 +247,7 @@ class FrozenDNA:
             loaded.model, tokenizer, device=device, dtype=dtype,
             attention_backend=attention_backend, max_tokens=max_tokens,
             batch_size=batch_size, pooling=pooling, provenance=provenance,
+            sequence_mode=sequence_mode,
         )
 
     @property
@@ -235,14 +264,35 @@ class FrozenDNA:
             "config_max_position_embeddings": config.max_position_embeddings,
             "rope_parameters": getattr(config, "rope_parameters", None),
             "pooling": self.pooling,
-            "normalization": "L2_after_all_windows",
+            "normalization": (
+                "L2_after_full_sequence_content_mean" if self.sequence_mode == "full"
+                else "L2_after_all_windows"
+            ),
+            "sequence_mode": self.sequence_mode,
+            "context_scope": "entire_bgc" if self.sequence_mode == "full" else "per_window",
             "max_tokens": self.max_tokens,
             "max_content_tokens": self.max_content_tokens,
+            "max_tokens_policy": (
+                "optional_full_input_limit_fail_without_truncation"
+                if self.sequence_mode == "full" else "per_window_limit_from_config"
+            ),
             "special_token_ids": dict(self.special_ids),
             "special_token_id_corrections": dict(self.special_id_corrections),
-            "window_policy": "full_sequence_BPE_then_disjoint_token_windows",
-            "window_aggregation": "content_token_count_weighted_mean",
+            "window_policy": (
+                "full_sequence_single_forward" if self.sequence_mode == "full"
+                else "full_sequence_BPE_then_disjoint_token_windows"
+            ),
+            "window_aggregation": (
+                "not_applicable_single_forward" if self.sequence_mode == "full"
+                else "content_token_count_weighted_mean"
+            ),
             "cross_window_attention": False,
+            "position_policy": (
+                "backbone_positions_across_entire_bgc" if self.sequence_mode == "full"
+                else "backbone_positions_restart_in_each_window"
+            ),
+            "config_length_enforced": self.sequence_mode == "windowed",
+            "automatic_window_fallback": False,
             "training_long_sequence_policy": "unknown",
             "unknown_token_policy": "retain_in_pooling_and_report_tokens_and_bases",
             "reverse_complement_policy": "input_orientation_only",
@@ -288,10 +338,15 @@ class FrozenDNA:
     def encode(self, sequence):
         """Return ``(unit_vector[d], sequence_metadata)`` for one entire BGC."""
         ids, offsets = self._tokenize(sequence)
-        windows = [
-            (start, min(start + self.max_content_tokens, len(ids)))
-            for start in range(0, len(ids), self.max_content_tokens)
-        ]
+        if self.sequence_mode == "full":
+            if self.max_tokens is not None and len(ids) + 2 > self.max_tokens:
+                raise DNASequenceTooLongError(len(ids) + 2, self.max_tokens)
+            windows = [(0, len(ids))]
+        else:
+            windows = [
+                (start, min(start + self.max_content_tokens, len(ids)))
+                for start in range(0, len(ids), self.max_content_tokens)
+            ]
         unknown_positions = [i for i, token in enumerate(ids) if token == self.special_ids["unk"]]
         unknown_bases = sum(offsets[i][1] - offsets[i][0] for i in unknown_positions)
         if unknown_positions:
@@ -301,6 +356,7 @@ class FrozenDNA:
                 RuntimeWarning, stacklevel=2,
             )
         total = torch.zeros(self.embedding_dim, dtype=torch.float32)
+        forward_shapes = []
         self.model.eval()
         with torch.inference_mode():
             for offset in range(0, len(windows), self.batch_size):
@@ -321,6 +377,7 @@ class FrozenDNA:
                     attention[row, :length + 2] = 1
                     content[row, 1:length + 1] = True
                 output = self.model(input_ids=inputs, attention_mask=attention, return_dict=True)
+                forward_shapes.append(list(inputs.shape))
                 hidden = output.last_hidden_state
                 if hidden.shape != (*inputs.shape, self.embedding_dim):
                     raise ValueError("Unexpected ModernBERT hidden-state shape")
@@ -336,6 +393,7 @@ class FrozenDNA:
             raise ValueError("DNA mean representation is zero or non-finite")
         vector = vector / norm
         metadata = {
+            "sequence_mode": self.sequence_mode,
             "sequence_length": len(sequence),
             "sequence_sha256": sha256(sequence.encode("ascii")).hexdigest(),
             "token_count": len(ids),
@@ -344,6 +402,13 @@ class FrozenDNA:
             "unknown_base_count": unknown_bases,
             "ambiguous_base_count": sum(base not in "ACGT" for base in sequence),
             "window_count": len(windows),
+            "forward_pass_count": len(forward_shapes),
+            "forward_input_shapes": forward_shapes,
+            "max_forward_tokens": max(shape[1] for shape in forward_shapes),
+            "total_input_tokens": len(ids) + 2 * len(windows),
+            "exceeds_config_max_position_embeddings": any(
+                shape[1] > int(self.model.config.max_position_embeddings) for shape in forward_shapes
+            ),
             "window_content_token_counts": [end - start for start, end in windows],
             "windows": [
                 {"token_start": start, "token_end": end,
