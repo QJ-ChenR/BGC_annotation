@@ -38,21 +38,29 @@ compatibility and provides a full-coverage comparison. No weights or RoPE settin
 are changed, and full mode never silently truncates or falls back to windows.
 Both modes export the same vector/ID/metadata format as the protein routes.
 
+For the current full-sequence experiment, first retain records whose complete
+DNA length is **at most 40,000 bp**. The filter copies accepted GenBank files
+unchanged and saves an inventory of selected, over-limit and invalid records.
+Filtering needs Biopython only; no checkpoint, tokenizer or GPU is loaded.
+
 ```bash
 python -m pip install -e '.[dna,visualization]'
-python -m experiment.validate_dna_encoding \
+python -m experiment.filter_gbk_by_length \
   --gbk /path/to/mibig_gbk_4.0 \
+  --max-bp 40000 --output outputs/mibig_le40kb
+
+python -m experiment.validate_dna_encoding \
+  --gbk outputs/mibig_le40kb/gbk --max-bp 40000 \
   --checkpoint /path/to/trained/checkpoint \
   --device cuda:0 --dtype bfloat16 --attention-backend flash_attention_2 \
-  --sample-count 5 --exclude-id BGC0002977 \
-  --output outputs/validation_dna_full
+  --sample-count 5 --output outputs/validation_dna_full_le40kb
 
 python -m experiment.extract_dna_features \
-  --gbk /path/to/mibig_gbk_4.0 \
+  --gbk outputs/mibig_le40kb/gbk --max-bp 40000 \
   --checkpoint /path/to/trained/checkpoint \
   --sequence-mode full \
   --device cuda:0 --dtype bfloat16 --attention-backend flash_attention_2 \
-  --exclude-id BGC0002977 --output outputs/features_dna_full
+  --output outputs/features_dna_full_le40kb
 ```
 
 These GPU commands require a compatible Flash Attention 2 installation. The
@@ -60,8 +68,11 @@ validation script samples by BPE length, verifies the actual full input, frozen
 parameters and pooling, compares against windows at the same precision/backend,
 and records timing, peak GPU memory and failures. A 48 GB GPU does not guarantee
 that every length will fit; failed records are never reported as successful
-full-length encodings. The explicit exclusion is the known chromosome-scale
-MIBiG record; omit it when intentionally studying that record.
+full-length encodings. The bp cutoff includes ambiguous bases and excludes
+whole records without cropping. It also excludes legitimate long BGCs, so it
+defines an experimental cohort rather than a test of biological validity.
+Compare protein and DNA results on the same retained IDs. The extraction and
+validation CLIs retain their previous behavior when `--max-bp` is omitted.
 
 See [the DNA architecture audit and server guide](docs/dna-features.md) for the
 768-dimensional model, full-length versus windowed semantics, validation outputs,

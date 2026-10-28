@@ -49,6 +49,7 @@ def build_parser():
     parser.add_argument("--attention-backend", choices=("sdpa", "eager", "flash_attention_2"), default="sdpa")
     parser.add_argument("--max-tokens", type=int, help="Optional full-input resource cap including CLS/SEP; exceeding it fails, never truncates.")
     parser.add_argument("--window-max-tokens", type=int, help="Windowed comparison size including CLS/SEP; defaults to checkpoint config.")
+    parser.add_argument("--max-bp", type=int, help="Optional inclusive whole-record length cutoff in bp; longer records are audited and excluded before tokenization and length sampling.")
     parser.add_argument("--sample-count", type=int, default=5, help="Default sample count at evenly spaced ranks of BPE length, including shortest/longest when >=2.")
     parser.add_argument("--all", action="store_true", help="Validate all selected inputs instead of length sampling.")
     parser.add_argument("--ids-from", type=Path, help="Explicit bgc_ids.tsv cohort; validates every listed ID instead of sampling.")
@@ -185,6 +186,8 @@ def _select_samples(scanned, count, use_all):
 
 
 def run(args):
+    if args.max_bp is not None and args.max_bp <= 0:
+        raise ValueError("max-bp must be positive.")
     if args.sample_count < 1 or any(
         value is not None and value <= 2 for value in (args.max_tokens, args.window_max_tokens)
     ):
@@ -210,6 +213,7 @@ def run(args):
     encoder = None
 
     def save():
+        summary["length_excluded_count"] = sum(item.get("status") == "length_excluded" for item in inventory)
         summary["selected_count"] = sum(bool(item.get("selected")) for item in inventory)
         summary["completed_count"] = len(results)
         summary["passed_count"] = sum(bool(row.get("validation_passed")) for row in results)
@@ -265,6 +269,10 @@ def run(args):
                 continue
             try:
                 sequence, record = read_dna(path)
+                item.update(record)
+                if args.max_bp is not None and record["base_count"] > args.max_bp:
+                    item.update(status="length_excluded", reason=f"Whole-record length {record['base_count']} bp exceeds --max-bp {args.max_bp}")
+                    continue
                 ids, _ = encoder._tokenize(sequence)
                 item.update(record, token_count=len(ids), status="eligible", reason="")
                 scanned.append(item)

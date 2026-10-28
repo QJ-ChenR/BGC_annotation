@@ -176,6 +176,48 @@ class DNAValidationTests(unittest.TestCase):
             run(args)
         self.assertEqual(content, (args.output / "summary.json").read_bytes())
 
+    def test_bp_cutoff_precedes_tokenization_and_validation_sampling(self):
+        from data_preparation.frozen_dna import FrozenDNA
+
+        self.write("short", "ACGT")
+        self.write("boundary", "ACGTACGT")
+        self.write("long", "ACGTACGTN")
+        original_tokenize = FrozenDNA._tokenize
+
+        def checked_tokenize(encoder, sequence):
+            self.assertLessEqual(len(sequence), 8)
+            return original_tokenize(encoder, sequence)
+
+        args = build_parser().parse_args(self.argv("cutoff", "--max-bp", "8"))
+        with patch.object(FrozenDNA, "_tokenize", checked_tokenize):
+            report = run(args)
+        self.assertEqual(report["status"], "passed")
+        self.assertEqual(report["selected_count"], 2)
+        self.assertEqual(report["length_excluded_count"], 1)
+        self.assertEqual(report["failures"], [])
+        with (args.output / "inventory.tsv").open() as handle:
+            rows = {r["bgc_id"]: r for r in csv.DictReader(handle, delimiter="\t")}
+        self.assertEqual(rows["boundary"]["status"], "passed")
+        self.assertEqual(rows["long"]["status"], "length_excluded")
+        self.assertEqual(rows["long"]["base_count"], "9")
+        self.assertEqual(rows["long"]["token_count"], "")
+
+    def test_no_inputs_below_bp_cutoff_fails_with_inventory(self):
+        self.write("long", "ACGTN")
+        args = build_parser().parse_args(self.argv("empty", "--max-bp", "4"))
+        with patch("data_preparation.frozen_dna.FrozenDNA.encode") as encode:
+            report = run(args)
+        encode.assert_not_called()
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["selected_count"], 0)
+        self.assertEqual(report["length_excluded_count"], 1)
+
+    def test_nonpositive_bp_limit_is_rejected(self):
+        args = build_parser().parse_args(self.argv("bad_limit", "--max-bp", "0"))
+        with self.assertRaisesRegex(ValueError, "max-bp"):
+            run(args)
+        self.assertFalse(args.output.exists())
+
     def test_auditor_rejects_a_windowed_fallback_presented_as_full(self):
         from data_preparation.frozen_dna import FrozenDNA
 

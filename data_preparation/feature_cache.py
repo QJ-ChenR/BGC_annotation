@@ -7,9 +7,6 @@ import pickle
 from collections.abc import Mapping
 from pathlib import Path
 
-import torch
-
-
 CACHE_FORMAT = "bgc_token_embeddings_v1"
 
 
@@ -27,6 +24,8 @@ def load_feature_cache(path, *, trusted=False):
     Legacy preprocessing cannot be inferred from tensor dimensions. Preserve
     that uncertainty rather than assigning the new parser's provenance to it.
     """
+    import torch
+
     path = Path(path)
     if path.suffix.lower() in {".pkl", ".pickle"}:
         if not trusted:
@@ -74,6 +73,8 @@ def load_feature_cache(path, *, trusted=False):
 
 def token_tensor(value, *, expected_dim=None):
     """Validate one unpadded BGC, including valid vectors containing zeros."""
+    import torch
+
     if isinstance(value, (list, tuple)):
         if not value or not all(isinstance(item, torch.Tensor) for item in value):
             raise ValueError("Expected a nonempty list of token tensors.")

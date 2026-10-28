@@ -195,6 +195,77 @@ class DNAExportTests(unittest.TestCase):
             run(args)
         self.assertFalse(args.output.exists())
 
+    def test_bp_cutoff_is_inclusive_and_applied_before_tokenization(self):
+        from data_preparation.frozen_dna import FrozenDNA
+
+        write_gbk(self.inputs / "short.gbk", "ACGT")
+        write_gbk(self.inputs / "boundary.gbk", "ACGTACGT")
+        write_gbk(self.inputs / "long.gbk", "ACGTACGTN")
+        original_tokenize = FrozenDNA._tokenize
+
+        def checked_tokenize(encoder, sequence):
+            self.assertLessEqual(len(sequence), 8)
+            return original_tokenize(encoder, sequence)
+
+        args = self.args("bp_cutoff", "--sequence-mode", "full", "--max-bp", "8")
+        with patch.object(FrozenDNA, "_tokenize", checked_tokenize):
+            metadata = run(args)
+        self.assertEqual(list(metadata["records"]), ["boundary", "short"])
+        self.assertEqual(metadata["records"]["boundary"]["forward_input_shapes"], [[1, 10]])
+        self.assertEqual(metadata["input"]["length_filter"]["max_bp"], 8)
+        self.assertTrue(metadata["input"]["length_filter"]["inclusive"])
+        self.assertEqual(metadata["length_excluded_count"], 1)
+        self.assertEqual(metadata["invalid_count"], 0)
+        self.assertEqual(metadata["status"], "complete_with_exclusions")
+        excluded = metadata["length_exclusions"][0]
+        self.assertEqual(excluded["bgc_id"], "long")
+        self.assertEqual(excluded["base_count"], 9)
+        self.assertEqual(excluded["ambiguous_base_count"], 1)
+        with (args.output / "failures.tsv").open() as handle:
+            self.assertEqual(next(csv.DictReader(handle, delimiter="\t"))["stage"], "length_filter")
+
+    def test_empty_bp_cohort_fails_with_audit_and_no_encoding(self):
+        write_gbk(self.inputs / "long.gbk", "ACGTACGTN")
+        args = self.args("none", "--max-bp", "8")
+        with patch("data_preparation.frozen_dna.FrozenDNA.encode") as encode:
+            with self.assertRaisesRegex(ValueError, "No valid BGC vectors"):
+                run(args)
+        encode.assert_not_called()
+        self.assertFalse((args.output / "embeddings.npy").exists())
+        report = json.loads((args.output / "metadata.json").read_text())
+        self.assertEqual(report["length_excluded_count"], 1)
+        self.assertEqual(report["length_exclusions"][0]["base_count"], 9)
+        self.assertEqual(report["status"], "failed")
+
+    def test_filtered_gbk_directory_and_id_manifest_feed_existing_export(self):
+        from experiment.filter_gbk_by_length import build_parser as filter_parser, run as filter_run
+
+        for key, sequence in (("A", "ACGT"), ("B", "ACGTACGT"), ("C", "ACGTACGTN")):
+            write_gbk(self.inputs / f"{key}.gbk", sequence)
+        filtered = self.root / "filtered"
+        filter_run(filter_parser().parse_args([
+            "--gbk", str(self.inputs), "--max-bp", "8", "--output", str(filtered),
+        ]))
+        from_directory = self.args("directory", "--sequence-mode", "full", "--max-bp", "8")
+        from_directory.gbk = filtered / "gbk"
+        directory_meta = run(from_directory)
+        from_ids = self.args("ids", "--sequence-mode", "full", "--max-bp", "8",
+                             "--ids-from", str(filtered / "bgc_ids.tsv"))
+        id_meta = run(from_ids)
+        self.assertEqual(list(directory_meta["records"]), ["A", "B"])
+        self.assertEqual(list(id_meta["records"]), ["A", "B"])
+        self.assertEqual(directory_meta["length_excluded_count"], 0)
+        np.testing.assert_allclose(np.load(from_directory.output / "embeddings.npy"),
+                                   np.load(from_ids.output / "embeddings.npy"), atol=1e-6)
+
+    def test_nonpositive_bp_limit_is_rejected(self):
+        for limit in ("0", "-1"):
+            with self.subTest(limit=limit):
+                args = self.args("bad_limit", "--max-bp", limit)
+                with self.assertRaisesRegex(ValueError, "max-bp"):
+                    run(args)
+                self.assertFalse(args.output.exists())
+
     def test_cohort_selection_explicit_exclusion_and_existing_output_protection(self):
         for key in ("A", "B", "C"):
             write_gbk(self.inputs / f"{key}.gbk", "ACGTACGT")

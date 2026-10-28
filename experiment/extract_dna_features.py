@@ -39,6 +39,12 @@ def build_parser():
              "Exceeding a full-mode limit fails; it never truncates or switches to windows.",
     )
     parser.add_argument("--window-batch-size", type=int, default=1, help="Windows per forward; full mode requires 1.")
+    parser.add_argument(
+        "--max-bp", type=int,
+        help="Optional inclusive whole-record DNA length cutoff in bp (e.g. 40000). "
+             "Longer records are reported and excluded before tokenization, never truncated. "
+             "Independent of --max-tokens; omitted means no bp cutoff.",
+    )
     parser.add_argument("--ids-from", type=Path, help="Optional existing bgc_ids.tsv to select the same BGC cohort.")
     parser.add_argument("--exclude-id", action="append", default=[], help="Explicit BGC exclusion, repeatable and recorded.")
     parser.add_argument("--skip-invalid", action="store_true", help="Record invalid inputs and export the remaining BGCs; memory errors and full-input limits remain fatal.")
@@ -98,6 +104,8 @@ def _is_out_of_memory(exc):
 
 
 def run(args):
+    if args.max_bp is not None and args.max_bp <= 0:
+        raise ValueError("max-bp must be positive.")
     if args.window_batch_size <= 0 or (args.max_tokens is not None and args.max_tokens <= 2):
         raise ValueError("window-batch-size must be positive and max-tokens must exceed 2.")
     if args.sequence_mode == "full" and args.window_batch_size != 1:
@@ -109,6 +117,12 @@ def run(args):
     if any((args.output / name).exists() for name in OUTPUT_FILES):
         raise ValueError("Output artifacts already exist; choose a new --output directory.")
     failures, ids, vectors, records = [], [], [], {}
+    length_exclusions = []
+    length_filter = None if args.max_bp is None else {
+        "max_bp": args.max_bp, "inclusive": True,
+        "length_definition": "entire single GenBank record, including ambiguous IUPAC bases",
+        "action": "exclude whole records exceeding the cutoff; never truncate",
+    }
     attempted_ids = []
     encoder = None
     try:
@@ -129,6 +143,12 @@ def run(args):
             attempted_ids.append(path.stem)
             try:
                 sequence, record = read_dna(path)
+                if args.max_bp is not None and record["base_count"] > args.max_bp:
+                    reason = f"Whole-record length {record['base_count']} bp exceeds --max-bp {args.max_bp}"
+                    length_exclusions.append({**record, "reason": reason})
+                    failures.append({"bgc_id": path.stem, "source": str(path),
+                                     "stage": "length_filter", "error": reason})
+                    continue
                 stage = "dna_encoding"
                 vector, encoding = encoder.encode(sequence)
                 array = vector.detach().cpu().numpy().astype(np.float32, copy=False)
@@ -191,9 +211,12 @@ def run(args):
                 "cohort": None if args.ids_from is None else {
                     "path": str(args.ids_from.resolve()), "sha256": file_sha256(args.ids_from)},
                 "explicit_exclusions": sorted(set(args.exclude_id)),
+                "length_filter": length_filter,
             },
             "records": records, "excluded_count": len(failures),
-            "invalid_count": sum(item["stage"] != "user_exclusion" for item in failures),
+            "length_exclusions": length_exclusions,
+            "length_excluded_count": len(length_exclusions),
+            "invalid_count": sum(item["stage"] not in {"user_exclusion", "length_filter"} for item in failures),
             "versions": _versions(),
             "source_sha256": {name: file_sha256(root / name) for name in (
                 "experiment/extract_dna_features.py", "data_preparation/dna_inputs.py",
@@ -213,6 +236,9 @@ def run(args):
             "format": "bgc_vectors_v1", "status": "failed", "route": "dna",
             "error": f"{type(exc).__name__}: {exc}", "excluded_count": len(failures),
             "sequence_mode": args.sequence_mode,
+            "length_filter": length_filter,
+            "length_exclusions": length_exclusions,
+            "length_excluded_count": len(length_exclusions),
             "device": args.device, "inference_dtype": args.dtype,
             "attention_backend": args.attention_backend,
             "requested_max_tokens": args.max_tokens,
